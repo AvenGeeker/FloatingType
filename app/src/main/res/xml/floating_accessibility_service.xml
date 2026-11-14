@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Event/flag combination tuned for keyboard-aware visibility:
+     eventTypes 0x402839, flags 0x50 (reportViewIds|retrieveInteractiveWindows),
+     canRetrieveWindowContent=true, feedbackGeneric, notificationTimeout=10.
+
+     All seven event types are subscribed, but they do not decide visibility
+     on their own: text/window/IME events only trigger a throttled
+     re-evaluation of the real input state (keyboard shown + editable field
+     focused). See FocusEventPolicy / BallVisibilityPolicy. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewClicked|typeViewFocused|typeViewTextChanged|typeWindowStateChanged|typeWindowContentChanged|typeViewTextSelectionChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="10"
+    android:settingsActivity="com.avengeeker.floatingtype.MainActivity" />

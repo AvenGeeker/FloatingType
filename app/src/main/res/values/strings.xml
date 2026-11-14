@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">FloatingType</string>
+    <string name="accessibility_service_description">FloatingType 需要无障碍服务来检测当前是否聚焦了输入框，从而显示/隐藏语音输入悬浮球，并把识别结果写入输入框。不会收集或上传您的输入内容。</string>
+    <string name="recording_channel_name">语音录音</string>
+    <string name="recording_notification_title">FloatingType 正在录音</string>
+    <string name="recording_notification_text">再次点击悬浮球停止并转写</string>
+</resources>

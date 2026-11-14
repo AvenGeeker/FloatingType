@@ -1,0 +1,146 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "ee79a4a56fd7794e7e2d924f5375c4d4",
+    "entities": [
+      {
+        "tableName": "input_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `createdAt` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `mode` TEXT NOT NULL, `sourcePackage` TEXT, `sourceAppLabel` TEXT, `rawText` TEXT NOT NULL, `finalText` TEXT NOT NULL, `asrModel` TEXT NOT NULL, `polishModel` TEXT, `recordingStatus` TEXT NOT NULL, `asrStatus` TEXT NOT NULL, `polishStatus` TEXT NOT NULL, `injectionStatus` TEXT NOT NULL, `recordingError` TEXT, `asrError` TEXT, `polishError` TEXT, `injectionError` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationMs",
+            "columnName": "durationMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mode",
+            "columnName": "mode",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourcePackage",
+            "columnName": "sourcePackage",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "sourceAppLabel",
+            "columnName": "sourceAppLabel",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "rawText",
+            "columnName": "rawText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "finalText",
+            "columnName": "finalText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "asrModel",
+            "columnName": "asrModel",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "polishModel",
+            "columnName": "polishModel",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "recordingStatus",
+            "columnName": "recordingStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "asrStatus",
+            "columnName": "asrStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "polishStatus",
+            "columnName": "polishStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "injectionStatus",
+            "columnName": "injectionStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordingError",
+            "columnName": "recordingError",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "asrError",
+            "columnName": "asrError",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "polishError",
+            "columnName": "polishError",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "injectionError",
+            "columnName": "injectionError",
+            "affinity": "TEXT",
+            "notNull": false
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_input_history_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_input_history_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          }
+        ],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'ee79a4a56fd7794e7e2d924f5375c4d4')"
+    ]
+  }
+}
