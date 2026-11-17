@@ -60,6 +60,31 @@ class HistoryPresentationTest {
     }
 
     @Test
+    fun transformLabel_byMode() {
+        assertEquals("润色", HistoryPresentation.transformLabel(InputMode.POLISH))
+        assertEquals("翻译", HistoryPresentation.transformLabel(InputMode.TRANSLATE))
+        assertEquals("润色", HistoryPresentation.transformLabel(InputMode.TRANSCRIBE))
+    }
+
+    @Test
+    fun modeLabel_translate() {
+        assertEquals("翻译", HistoryPresentation.modeLabel(InputMode.TRANSLATE))
+    }
+
+    @Test
+    fun statusLabel_translateFallback() {
+        val r = record(
+            mode = InputMode.TRANSLATE,
+            rawText = "你好",
+            finalText = "你好",
+            polishStatus = StageStatus.FAILED,
+            polishError = "Timeout",
+        )
+        assertEquals("原文已输入", HistoryPresentation.statusLabel(r))
+        assertEquals(StatusTone.WARNING, HistoryPresentation.statusTone(r))
+    }
+
+    @Test
     fun statusLabel_failures() {
         assertEquals("录音失败", HistoryPresentation.statusLabel(record(recordingStatus = StageStatus.FAILED)))
         assertEquals("转写失败", HistoryPresentation.statusLabel(record(asrStatus = StageStatus.FAILED)))

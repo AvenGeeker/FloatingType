@@ -51,6 +51,8 @@ import com.avengeeker.floatingtype.history.StageStatus
 import com.avengeeker.floatingtype.history.StatusTone
 import com.avengeeker.floatingtype.polish.OpenAiCompatiblePolishEngine
 import com.avengeeker.floatingtype.polish.PolishException
+import com.avengeeker.floatingtype.translate.OpenAiCompatibleTranslateEngine
+import com.avengeeker.floatingtype.translate.TranslateException
 import com.avengeeker.floatingtype.ui.components.MetaRow
 import com.avengeeker.floatingtype.ui.components.SectionCard
 import com.avengeeker.floatingtype.ui.components.StatusChip
@@ -69,6 +71,8 @@ fun HistoryDetailScreen(
     val settings = ServiceLocator.settings
     val history = ServiceLocator.history
     val polishEngine = remember { OpenAiCompatiblePolishEngine(settings) }
+    val translateEngine = remember { OpenAiCompatibleTranslateEngine(settings) }
+    val transformLabel = HistoryPresentation.transformLabel(record.mode)
     var repolishing by remember { mutableStateOf(false) }
     var retryError by remember { mutableStateOf<String?>(null) }
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -101,7 +105,7 @@ fun HistoryDetailScreen(
                     MetaRow(Icons.Outlined.Smartphone, "来源应用", record.sourceLabel)
                     MetaRow(Icons.Outlined.Mic, "录音时长", HistoryPresentation.formatDuration(record.durationMs))
                     MetaRow(Icons.Outlined.Info, "ASR 模型", record.asrModel)
-                    MetaRow(Icons.Outlined.AutoAwesome, "润色模型", record.polishModel ?: "—")
+                    MetaRow(Icons.Outlined.AutoAwesome, "${transformLabel}模型", record.polishModel ?: "—")
                 }
             }
             if (record.rawText.isNotBlank()) {
@@ -111,15 +115,15 @@ fun HistoryDetailScreen(
                     }
                 }
             }
-            if (record.mode == InputMode.POLISH) {
+            if (record.mode.isTransform) {
                 item {
                     SectionCard(
-                        title = "润色结果",
+                        title = "${transformLabel}结果",
                         icon = Icons.Outlined.AutoAwesome,
-                        subtitle = if (record.polishStatus == StageStatus.FAILED) "润色失败，已回退原文" else null,
+                        subtitle = if (record.polishStatus == StageStatus.FAILED) "${transformLabel}失败，已回退原文" else null,
                     ) {
                         Text(
-                            text = record.finalText.ifBlank { "无润色结果" },
+                            text = record.finalText.ifBlank { "无${transformLabel}结果" },
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
@@ -127,10 +131,10 @@ fun HistoryDetailScreen(
             }
             errorCard("录音失败", record.recordingError)
             errorCard("转写失败", record.asrError)
-            errorCard("润色失败", record.polishError)
+            errorCard("${transformLabel}失败", record.polishError)
             errorCard("注入失败", record.injectionError)
             if (retryError != null) {
-                item { ErrorCard(title = "重新润色失败", message = retryError!!) }
+                item { ErrorCard(title = "重新${transformLabel}失败", message = retryError!!) }
             }
         }
 
@@ -163,20 +167,26 @@ fun HistoryDetailScreen(
                     }
                 }
                 if (record.rawText.isNotBlank() &&
-                    (record.mode == InputMode.POLISH || record.rawText != record.finalText)
+                    (record.mode.isTransform || record.rawText != record.finalText)
                 ) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = { onCopy(record.rawText) },
                             modifier = Modifier.weight(1f),
                         ) { Text("复制原文") }
-                        if (record.mode == InputMode.POLISH) {
+                        if (record.mode.isTransform) {
                             Button(
                                 onClick = {
                                     scope.launch {
                                         repolishing = true
                                         retryError = null
-                                        val result = polishEngine.polish(record.rawText)
+                                        val result = when (record.mode) {
+                                            InputMode.TRANSLATE -> translateEngine.translate(
+                                                record.rawText,
+                                                settings.translateTargetLanguage,
+                                            )
+                                            else -> polishEngine.polish(record.rawText)
+                                        }
                                         result.fold(
                                             onSuccess = { text ->
                                                 history.update(
@@ -187,15 +197,15 @@ fun HistoryDetailScreen(
                                                         polishModel = settings.polishModel,
                                                     )
                                                 )
-                                                onMessage("已重新润色")
+                                                onMessage("已重新$transformLabel")
                                             },
                                             onFailure = { e ->
-                                                retryError = if (e is PolishException) {
-                                                    "${e.code}: ${e.message}"
-                                                } else {
-                                                    e.message ?: "润色失败"
+                                                retryError = when (e) {
+                                                    is PolishException -> "${e.code}: ${e.message}"
+                                                    is TranslateException -> "${e.code}: ${e.message}"
+                                                    else -> e.message ?: "${transformLabel}失败"
                                                 }
-                                                onMessage("重新润色失败")
+                                                onMessage("重新${transformLabel}失败")
                                             },
                                         )
                                         repolishing = false
@@ -213,7 +223,7 @@ fun HistoryDetailScreen(
                                     Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                                 }
                                 Spacer(Modifier.width(6.dp))
-                                Text("重新润色")
+                                Text("重新$transformLabel")
                             }
                         }
                     }

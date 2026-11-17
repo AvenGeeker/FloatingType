@@ -21,7 +21,7 @@ FloatingType 是一个 Android 无障碍悬浮球 AI 语音输入应用：键盘
 export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
 
 ./gradlew assembleDebug          # 构建 debug APK
-./gradlew testDebugUnitTest      # 单元测试（当前 90 个，必须全绿）
+./gradlew testDebugUnitTest      # 单元测试（当前 118 个，必须全绿）
 ./gradlew assembleRelease        # release（未签名、未混淆）
 ./gradlew connectedDebugAndroidTest  # 仪器测试（目前仅模板，需真机/模拟器）
 
@@ -39,11 +39,12 @@ export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
 | 包 | 职责 | 关键文件 |
 | --- | --- | --- |
 | `accessibility/` | 常驻 backbone 与显隐/焦点/注入 | `FloatingAccessibilityService`、`FocusEventPolicy`、`BallVisibilityPolicy`、`InputFocusFinder`、`TextInjector` |
-| `overlay/` | WindowManager 悬浮球 | `OverlayBallManager`（手势/定位）、`BallView`（绘制/动画）、`BallMetrics`、`BallState` |
+| `overlay/` | WindowManager 悬浮球 | `OverlayBallManager`（手势/定位）、`BallView`（绘制/动画）、`BallMetrics`、`BallState`、`RadialMenuGeometry`（纯函数朝向/扇形布局/就近命中）、`RadialMenuView`/`RadialMenuOverlay`（以球为圆心、药丸沿半径旋转的放射状扇形菜单，撤回为菜单项） |
 | `audio/` | 录音 | `AudioRecordingForegroundService`（microphone FGS）、`RecorderController`、`WavEncoder` |
 | `asr/` | 语音转写 | `AsrEngine`（接口）、`DashScopeAsrEngine`、`AsrResponseParser` |
 | `polish/` | AI 润色 | `PolishEngine`（接口）、`OpenAiCompatiblePolishEngine`、`PolishConfig`、`PolishResponseParser` |
-| `pipeline/` | 会话状态机编排 | `VoiceInputPipeline` |
+| `translate/` | AI 翻译（复用润色接口） | `TranslateEngine`（接口）、`OpenAiCompatibleTranslateEngine`、`TranslatePrompt`（纯函数提示词/中英判定） |
+| `pipeline/` | 会话状态机编排 + 模式选择/后处理/撤回 | `VoiceInputPipeline` |
 | `history/` | Room 历史 | `AppDatabase`（v1）、`InputHistoryEntity`、`HistoryDao`、`HistoryRepository`、`HistoryPresentation`、`InputMode`、`StageStatus` |
 | `permission/` | 权限状态 | `PermissionRepository`、`PermissionStatus` |
 | `settings/` | 设置与配置优先级 | `SettingsRepository`（SharedPreferences）、`ServiceConfigDefaults`（纯函数） |
@@ -66,20 +67,22 @@ export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
 3. **过滤自身事件。** 本应用 UI 与悬浮球自身会发 content change，`onAccessibilityEvent` 里按 `packageName` 过滤，否则会形成布局反馈循环。新增事件处理时保持该过滤。
 4. **Compose 焦点兜底不能删。** 虚拟视图树 `findFocus(FOCUS_INPUT)` 返回非焦点 stub；`InputFocusFinder` 用缓存节点 refresh + 有界树搜索（`MAX_VISITED_NODES = 400`）兜底，树搜索节流 `TREE_SEARCH_MIN_INTERVAL_MS = 400ms`（焦点/点击事件可强制触发）。
 5. **线程模型：** `VoiceInputPipeline` 所有状态迁移在主线程（`Dispatchers.Main.immediate` + main Handler）；网络在引擎内部 `Dispatchers.IO`。状态暴露为 `StateFlow<BallState>`。不要把网络或磁盘 IO 搬到主线程，也不要在引擎里碰 UI。
-6. **历史写入语义：** 真正开始录音才建立 Session；会话结束时一次性写库，成功与失败（录音/转写/润色/注入各阶段 `StageStatus` + 错误）都记录；未聚焦、未配 Key 等前置失败**不**记录。重新润色只更新历史，不重新注入。
+6. **历史写入语义：** 真正开始录音才建立 Session；会话结束时一次性写库，成功与失败（录音/转写/润色/注入各阶段 `StageStatus` + 错误）都记录；未聚焦、未配 Key 等前置失败**不**记录。重新润色/翻译只更新历史，不重新注入。**已有文本后处理（润色/翻译）不建立 Session、不写历史**，但可撤回。润色与翻译共用历史的变换阶段列（`polish*` 按模式解释），不改 Entity、无需迁移。
 7. **配置优先级：** `local.properties` → BuildConfig（非空时）> App 内 SharedPreferences > 内置默认，统一走纯函数 `ServiceConfigDefaults.resolve / resolveBaseUrl`（后者去尾部斜杠）。被 local 接管的字段 UI 只读并标注来源（`*FromLocal` 标志）。新增设置项必须同时支持这三级与只读标注。
 8. **BuildConfig 字段刻意非常量。** `app/build.gradle.kts` 用 `new String("...")` 生成字段，避免编译期内联导致增量构建读不到 `local.properties` 新值。**不要**「优化」成字符串字面量。
-9. **润色 Key 复用规则：** `polish.apiKey` 为空时，仅当润色 Base URL 仍为默认 DashScope compatible-mode 地址才复用 ASR Key；自定义地址必须独立 Key，缺失则回退原文。
+9. **润色 Key 复用规则：** `polish.apiKey` 为空时，仅当润色 Base URL 仍为默认 DashScope compatible-mode 地址才复用 ASR Key；自定义地址必须独立 Key，缺失则回退原文。**翻译复用润色端点/Key/模型**，Key 复用规则完全相同。
 10. **录音合规与参数：** targetSdk 34 必须走 `foregroundServiceType="microphone"` 前台服务 + `FOREGROUND_SERVICE_MICROPHONE` 权限。AudioRecord 16kHz 单声道 PCM16；`MAX_DURATION_MS = 60_000` 自动停止，`MIN_DURATION_MS = 300` 过短报错。WAV 头由 `WavEncoder` 生成（有单测）。
 11. **注入链路：** 选区拼接（`TextInjector.splice`，单测 `TextSpliceTest`）+ `ACTION_SET_TEXT`，失败回退剪贴板粘贴，再失败提示重新聚焦并记失败历史。**密码输入框不出球、不注入**，任何改动不得破坏该隐私保护。
 12. **Room 迁移纪律：** `AppDatabase` version = 1，`exportSchema = true`，schema 在 `app/schemas/`。改 Entity 必须：版本号 +1、提供 `Migration`（禁止 `fallbackToDestructiveMigration` 丢用户历史）、提交新 schema JSON。
 13. **无障碍订阅配置联动：** 改 `floating_accessibility_service.xml` 的 eventTypes/flags 时，同步检查 `FocusEventPolicy` 分类与其单测；`notificationTimeout=10` 等参数为实测调优值，改动需真机验证。
 14. **日志隐私：** 不记录 API Key、Base64 音频、完整用户文本；只记错误码、HTTP 状态、request id、尺寸与时序；远端错误体用 `LogUtils.clip`（默认 2000 字符）裁剪后记录。
+15. **翻译模式：** `InputMode` 三值（TRANSCRIBE/POLISH/TRANSLATE）。翻译复用润色 OpenAI 兼容接口，仅提示词与目标语言不同；目标语言由 `TranslatePrompt` 纯函数解析（`auto`=中文为主译英、其余译中）。`translateTargetLanguage` 是普通 pref（无 local.properties 覆盖，发布清单的六个服务键不变）。
+16. **方向性扇形菜单与撤回：** 长按悬浮球弹出**以球为圆心、朝远离最近屏幕边缘/键盘方向展开的扇形菜单**（`RadialMenuGeometry` 纯函数：`openDirectionDeg` 取「正对最近屏幕边」的方向（右→正左、底→正上、角落→对角，键盘上沿视为底边），使侧边时扇面关于水平 X 轴上下镜像对称，3/4 项都对称；`itemAngles` 在 120° 扇面内均分；每个药丸按所在角度旋转使长轴沿半径、并用 `readableAngle` 翻正文字保持可读；就近命中；菜单窗口 `FLAG_NOT_TOUCHABLE`，长按手势留在球窗口，球心为命中原点）。**球在右→向左开、在左下→向右上开，以此类推**。菜单是**独立 NOT_TOUCHABLE 悬浮窗**：因部分 OEM（如 MIUI）会把越界悬浮窗整体推移，导致扇形偏离球心，所以用 `RadialMenuGeometry.clampWindow` 把窗口夹到屏幕内、并返回**补偿原点**让 `RadialMenuView` 仍以球心为绘制原点，扇形始终居中于球。为让对称扇面完整露在键盘上方，长按时球会**瞬时**小幅移位（必要时上移/内收），松开后动画回位。仍需拖动超过阈值才判定选择（避免意外选中）。**常态球体保持简洁，菜单仅长按出现**。三个模式恒在；有可撤回操作时菜单追加「撤回」项，再次长按选「撤回」触发。后处理/注入前快照原文+光标，写回后短时效（`UNDO_TTL_MS = 8s`）内可撤回，仅当输入框内容仍等于写回结果时才恢复；球隐藏即清空撤回。后处理整段读写与撤回均跳过密码框（不变量 11）。
 
 ## 代码风格与约定
 
 - Kotlin official code style（`kotlin.code.style=official`），4 空格缩进；JVM target 11，可用 Kotlin 2.0 语言特性。
-- **核心逻辑写成无 Android 依赖的纯函数/对象**（参考 `FocusEventPolicy`、`BallVisibilityPolicy`、`ServiceConfigDefaults`、`HistoryPresentation`），框架胶水保持薄；新逻辑必须配 JUnit 4 单测（`app/src/test/` 按包镜像）。
+- **核心逻辑写成无 Android 依赖的纯函数/对象**（参考 `FocusEventPolicy`、`BallVisibilityPolicy`、`ServiceConfigDefaults`、`HistoryPresentation`、`TranslatePrompt`、`RadialMenuGeometry`），框架胶水保持薄；新逻辑必须配 JUnit 4 单测（`app/src/test/` 按包镜像）。
 - 代码注释/KDoc 用英文，解释「为什么」（现有风格）；用户可见文案用中文，集中在 `res/values/strings.xml`，不要硬编码到 Composable。
 - UI 遵循 `ui/theme/UiTokens`：Material 3 卡片、16dp 圆角与页面边距、12dp 组间距、8dp 间距网格、触控目标 ≥48dp；Android 12+ 动态取色，低版本回退品牌靛紫；浅色/深色与 edge-to-edge 都要兼顾。
 - 设置变更通过 `SettingsRepository.notifyChanged()` 广播，监听方（如无障碍服务）据此刷新；新增设置项沿用该机制，不要另起监听体系。
@@ -88,7 +91,7 @@ export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
 
 ## 测试要求
 
-- 提交前必跑：`./gradlew testDebugUnitTest`（90 个）与 `./gradlew assembleDebug`。
+- 提交前必跑：`./gradlew testDebugUnitTest`（118 个）与 `./gradlew assembleDebug`。
 - 新增/修改纯函数逻辑必须同步增改单测；解析类测试用真实响应结构（参考 `AsrResponseParserTest`、`PolishResponseParserTest`）。
 - 显隐、注入、录音、权限等框架行为无法 JVM 单测覆盖：按 README「手测清单」真机回归，至少覆盖 Compose 应用输入框、键盘弹起/收起、录音中收起键盘、长按切换模式。
 - `androidTest` 目前只有模板（`ExampleInstrumentedTest`），不要声称仪器测试已覆盖业务。

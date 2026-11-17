@@ -20,15 +20,19 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Adjust
+import androidx.compose.material.icons.outlined.ArrowDropDown
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -62,6 +66,7 @@ import com.avengeeker.floatingtype.history.StatusTone
 import com.avengeeker.floatingtype.overlay.BallView
 import com.avengeeker.floatingtype.permission.PermissionStatus
 import com.avengeeker.floatingtype.settings.SettingsRepository
+import com.avengeeker.floatingtype.translate.TranslatePrompt
 import com.avengeeker.floatingtype.ui.components.SectionCard
 import com.avengeeker.floatingtype.ui.components.StatusChip
 import com.avengeeker.floatingtype.ui.theme.UiTokens
@@ -93,6 +98,8 @@ fun SettingsScreen(
     var polishKeyVisible by remember { mutableStateOf(false) }
     var polishModel by remember { mutableStateOf(settings.polishModel) }
     var polishPrompt by remember { mutableStateOf(settings.polishPrompt) }
+    var translateTarget by remember { mutableStateOf(settings.translateTargetLanguage) }
+    var targetMenuExpanded by remember { mutableStateOf(false) }
     var ballEnabled by remember { mutableStateOf(settings.ballEnabled) }
     var ballSize by remember { mutableStateOf(settings.ballSizeDp.toFloat()) }
     var opacity by remember { mutableStateOf(settings.ballOpacity) }
@@ -124,25 +131,31 @@ fun SettingsScreen(
         SectionCard(
             title = "默认输入模式",
             icon = Icons.Outlined.Tune,
-            subtitle = "长按悬浮球也可切换并保存",
+            subtitle = "长按悬浮球弹出扇形菜单切换并保存",
         ) {
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                InputMode.entries.forEachIndexed { index, m ->
+                InputMode.entries.forEach { m ->
                     SegmentedButton(
                         selected = mode == m,
                         onClick = { settings.defaultMode = m },
                         shape = RoundedCornerShape(12.dp),
                     ) {
-                        Text(if (m == InputMode.TRANSCRIBE) "直接转写" else "AI 润色")
+                        Text(
+                            when (m) {
+                                InputMode.TRANSCRIBE -> "直接转写"
+                                InputMode.POLISH -> "AI 润色"
+                                InputMode.TRANSLATE -> "翻译"
+                            }
+                        )
                     }
                 }
             }
             Spacer(Modifier.height(8.dp))
             Text(
-                text = if (mode == InputMode.TRANSCRIBE) {
-                    "直接转写：语音识别后原文写入输入框。"
-                } else {
-                    "AI 润色：语音识别后先润色，再写入输入框；润色失败自动回退原文。"
+                text = when (mode) {
+                    InputMode.TRANSCRIBE -> "直接转写：语音识别后原文写入输入框。"
+                    InputMode.POLISH -> "AI 润色：语音识别后先润色，再写入输入框；润色失败自动回退原文。"
+                    InputMode.TRANSLATE -> "翻译：语音识别后翻译成目标语言再写入；输入框已有文本时，长按选「翻译」可直接转换原文。失败自动回退原文。"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -295,6 +308,45 @@ fun SettingsScreen(
             }
             Text(
                 "自定义 Base URL 时不会复用 DashScope Key，请填写独立 API Key；缺少 Key 时润色失败并回退原文。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        SectionCard(
+            title = "翻译",
+            icon = Icons.Outlined.Translate,
+            subtitle = "复用 AI 润色接口，仅切换提示词",
+        ) {
+            Text("目标语言", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            Box(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { targetMenuExpanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(TranslatePrompt.displayName(translateTarget), modifier = Modifier.weight(1f))
+                    Icon(Icons.Outlined.ArrowDropDown, contentDescription = null)
+                }
+                DropdownMenu(
+                    expanded = targetMenuExpanded,
+                    onDismissRequest = { targetMenuExpanded = false },
+                ) {
+                    TranslatePrompt.SUPPORTED.forEach { (code, name) ->
+                        DropdownMenuItem(
+                            text = { Text(name) },
+                            onClick = {
+                                translateTarget = code
+                                settings.translateTargetLanguage = code
+                                targetMenuExpanded = false
+                            },
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "「自动」按原文语言中英互译：中文为主译成英文，其余译成中文。转换输入框已有文本后，再次长按悬浮球，在扇形菜单选「撤回」恢复原文。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

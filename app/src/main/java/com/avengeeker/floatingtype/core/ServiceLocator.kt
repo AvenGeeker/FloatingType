@@ -9,6 +9,7 @@ import com.avengeeker.floatingtype.permission.PermissionRepository
 import com.avengeeker.floatingtype.pipeline.VoiceInputPipeline
 import com.avengeeker.floatingtype.polish.OpenAiCompatiblePolishEngine
 import com.avengeeker.floatingtype.settings.SettingsRepository
+import com.avengeeker.floatingtype.translate.OpenAiCompatibleTranslateEngine
 
 /**
  * Lightweight manual service locator. Everything is application-scoped;
@@ -43,6 +44,7 @@ object ServiceLocator {
             history = history,
             asrFactory = { DashScopeAsrEngine(settings) },
             polishFactory = { OpenAiCompatiblePolishEngine(settings) },
+            translateFactory = { OpenAiCompatibleTranslateEngine(settings) },
         )
         overlay = OverlayBallManager(appContext, settings, pipeline)
         pipeline.overlay = overlay

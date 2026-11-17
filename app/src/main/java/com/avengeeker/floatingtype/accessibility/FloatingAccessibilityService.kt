@@ -103,6 +103,16 @@ class FloatingAccessibilityService : AccessibilityService() {
 
     fun injectText(text: String): Boolean = TextInjector.inject(this, text, cachedInputNode)
 
+    /** Full text + selection of the focused editable field (null if none/password). */
+    fun inputSnapshot(): TextInjector.Snapshot? = TextInjector.readSnapshot(this, cachedInputNode)
+
+    /** Current full text of the focused editable field, for undo staleness checks. */
+    fun currentInputText(): String? = inputSnapshot()?.text
+
+    /** Replace the entire focused field text (post-processing / undo). */
+    fun replaceInputText(text: String, selectionStart: Int? = null, selectionEnd: Int? = null): Boolean =
+        TextInjector.replace(this, text, cachedInputNode, selectionStart, selectionEnd)
+
     /** Schedule one coalesced evaluation, never later than an already pending one. */
     private fun requestEvaluation(delayMs: Long) {
         val target = SystemClock.elapsedRealtime() + delayMs

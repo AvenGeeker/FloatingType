@@ -2,6 +2,7 @@ package com.avengeeker.floatingtype.overlay
 
 import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -13,17 +14,29 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import com.avengeeker.floatingtype.R
+import com.avengeeker.floatingtype.history.InputMode
 import com.avengeeker.floatingtype.pipeline.VoiceInputPipeline
 import com.avengeeker.floatingtype.settings.SettingsRepository
+import com.avengeeker.floatingtype.util.Haptics
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.sin
 
 /**
  * WindowManager-backed floating ball:
  * TYPE_APPLICATION_OVERLAY (26+) / TYPE_PHONE (24-25), not focusable,
  * draggable with edge snapping, positioned above the keyboard when visible.
+ *
+ * The resting ball stays simple (gradient orb + mic + mode badge). Long-press
+ * opens a radial menu of radially-rotated pills [RadialMenuOverlay] laid on a
+ * fan centered on the ball. The fan opens straight away from the nearest screen
+ * edge (right -> left, bottom -> up, corner -> diagonal) so it is mirror-symmetric
+ * about the X axis for side placements. The menu window is clamped on-screen and
+ * the view draws around the ball's origin, so OEMs cannot shift it off the ball.
  */
 class OverlayBallManager(
     private val context: Context,
@@ -38,6 +51,23 @@ class OverlayBallManager(
     private var layoutParams: WindowManager.LayoutParams? = null
     private var snapAnimator: ValueAnimator? = null
 
+    private val radialMenu = RadialMenuOverlay(context)
+    private var undoAvailable = false
+
+    // Radial-menu gesture state, valid only while menuActive.
+    private val menuModes = InputMode.entries
+    private var menuActive = false
+    private var menuHasUndo = false
+    private var menuCenterX = 0
+    private var menuCenterY = 0
+    private var menuCenters: List<Pair<Double, Double>> = emptyList()
+    private var menuCaptureRadius = 0.0
+
+    // Ball position before the small shift that makes the fan fully visible.
+    private var menuRestoreX = Int.MIN_VALUE
+    private var menuRestoreY = Int.MIN_VALUE
+    private var restoreAnimator: ValueAnimator? = null
+
     var isVisible: Boolean = false
         private set
 
@@ -49,14 +79,13 @@ class OverlayBallManager(
 
     private var lastImeTop = -1
 
-    // Last values handed to WindowManager. Focus is re-evaluated while the user
-    // types, so skip relayouts that would not change anything on screen.
     private var appliedX = Int.MIN_VALUE
     private var appliedY = Int.MIN_VALUE
     private var appliedSize = -1
 
     init {
         settings.addChangeListener(settingsListener)
+        pipeline.undoAvailabilityListener = { available -> undoAvailable = available }
     }
 
     fun show(imeTop: Int) {
@@ -74,12 +103,18 @@ class OverlayBallManager(
             }
             view.setState(currentState)
         } catch (_: Exception) {
-            // Overlay permission may have been revoked; stay hidden.
             isVisible = false
         }
     }
 
     fun hide() {
+        restoreAnimator?.cancel()
+        restoreAnimator = null
+        menuRestoreX = Int.MIN_VALUE
+        menuRestoreY = Int.MIN_VALUE
+        menuActive = false
+        radialMenu.hide()
+        pipeline.clearUndo()
         val view = ballView
         if (isVisible && view != null) {
             try {
@@ -130,33 +165,32 @@ class OverlayBallManager(
         val params = layoutParams ?: return
         val size = ballSizePx()
         val padding = BallMetrics.ripplePadding(size)
-        // Reserve ripple room: the window is larger than the visible ball, which
-        // keeps its configured diameter and is centered in the padded window.
         view.ballDiameterPx = size
         params.width = BallMetrics.windowSize(size)
         params.height = BallMetrics.windowSize(size)
         if (view.ballOpacity != settings.ballOpacity) view.ballOpacity = settings.ballOpacity
         if (view.mode != settings.defaultMode) view.mode = settings.defaultMode
 
+        if (menuActive) {
+            markApplied(params)
+            return
+        }
+
         val metrics = context.resources.displayMetrics
         val screenW = metrics.widthPixels
         val screenH = metrics.heightPixels
-        val margin = marginPx()
-
         var x = settings.ballX
         var y = settings.ballY
         if (x < 0 || y < 0) {
-            x = screenW - size - margin
+            x = screenW - size - marginPx()
             y = (screenH * 0.6f).toInt()
         }
-        x = x.coerceIn(margin, max(margin, screenW - size - margin))
-        y = y.coerceIn(margin, max(margin, screenH - size - margin))
+        x = x.coerceIn(marginPx(), max(marginPx(), screenW - size - marginPx()))
+        y = y.coerceIn(marginPx(), max(marginPx(), screenH - size - marginPx()))
         if (imeTop in 0 until screenH) {
-            val maxYAboveKeyboard = imeTop - size - margin
-            if (y > maxYAboveKeyboard) y = max(margin, maxYAboveKeyboard)
+            val maxYAboveKeyboard = imeTop - size - marginPx()
+            if (y > maxYAboveKeyboard) y = max(marginPx(), maxYAboveKeyboard)
         }
-        // (x, y) is the visible ball's top-left; offset by the padding so the
-        // padded window places the ball exactly there.
         params.x = x - padding
         params.y = y - padding
         if (params.x != appliedX || params.y != appliedY || params.width != appliedSize) {
@@ -182,8 +216,6 @@ class OverlayBallManager(
 
     private fun persistPosition() {
         val params = layoutParams ?: return
-        // Persist the visible ball's top-left (not the padded window's), so the
-        // stored coordinates keep their meaning across size changes and restarts.
         val padding = BallMetrics.ripplePadding(ballSizePx())
         settings.ballX = params.x + padding
         settings.ballY = params.y + padding
@@ -196,7 +228,6 @@ class OverlayBallManager(
         val size = ballSizePx()
         val padding = BallMetrics.ripplePadding(size)
         val margin = marginPx()
-        // Snap in visible-ball coordinates, then convert back to window coords.
         val center = params.x + padding + size / 2f
         val targetBallX = if (center < metrics.widthPixels / 2f) {
             margin
@@ -219,6 +250,157 @@ class OverlayBallManager(
         persistPosition()
     }
 
+    // ---- Radial mode menu -------------------------------------------------
+
+    private fun buildMenuItems(): List<RadialMenuItem> {
+        val items = menuModes.map { RadialMenuItem(it.label, modeColor(it), modeIcon(it)) }.toMutableList()
+        if (undoAvailable) {
+            items.add(RadialMenuItem(context.getString(R.string.undo_action), UNDO_COLOR, R.drawable.ic_undo))
+        }
+        return items
+    }
+
+    private fun modeIcon(mode: InputMode): Int = when (mode) {
+        InputMode.TRANSCRIBE -> R.drawable.ic_mic
+        InputMode.POLISH -> R.drawable.ic_mode_polish
+        InputMode.TRANSLATE -> R.drawable.ic_mode_translate
+    }
+
+    private fun modeColor(mode: InputMode): Int = when (mode) {
+        InputMode.TRANSCRIBE -> Color.parseColor("#4F46E5")
+        InputMode.POLISH -> Color.parseColor("#0F766E")
+        InputMode.TRANSLATE -> Color.parseColor("#0891B2")
+    }
+
+    private fun openRadialMenu() {
+        val view = ballView ?: return
+        val params = layoutParams ?: return
+        val metrics = context.resources.displayMetrics
+        val screenW = metrics.widthPixels
+        val screenH = metrics.heightPixels
+        val size = ballSizePx()
+        val padding = BallMetrics.ripplePadding(size)
+        val curCenterX = params.x + padding + size / 2f
+        val curCenterY = params.y + padding + size / 2f
+        val ballRadius = BallMetrics.ballRadius(size)
+        val capsuleWidth = size * 1.10f
+        val capsuleHeight = size * 0.46f
+        val aHalf = capsuleWidth / 2f
+        val bHalf = capsuleHeight / 2f
+        val items = buildMenuItems()
+        val count = items.size
+        if (count <= 0) return
+
+        val margin = marginPx().toFloat()
+        val safeTop = margin
+        val imeTop = if (lastImeTop in 0 until screenH) lastImeTop.toFloat() else screenH.toFloat()
+        val safeBottom = imeTop - margin
+        // Open straight away from the nearest edge (right -> left, etc.) so the fan
+        // is mirror-symmetric about the X axis for side placements.
+        val centerAngle = RadialMenuGeometry.openDirectionDeg(
+            curCenterX, curCenterY, screenW.toFloat(), imeTop,
+        )
+        val sweep = RadialMenuGeometry.FAN_SWEEP_DEG
+        val angles = RadialMenuGeometry.itemAngles(centerAngle, sweep, count)
+
+        val gap = size * 0.06f
+        val stepDeg = if (count > 1) sweep / (count - 1) else sweep
+        val clearR = ballRadius + gap + aHalf
+        val spacingR = (aHalf + (2.0 * bHalf + gap) / (2.0 * sin(Math.toRadians(stepDeg / 2.0)))).toFloat()
+        val radius = max(clearR, spacingR)
+
+        fun halfX(ang: Double): Float {
+            val rad = Math.toRadians(ang)
+            return (abs(cos(rad)) * aHalf + abs(sin(rad)) * bHalf).toFloat()
+        }
+        fun halfY(ang: Double): Float {
+            val rad = Math.toRadians(ang)
+            return (abs(sin(rad)) * aHalf + abs(cos(rad)) * bHalf).toFloat()
+        }
+        val leftExtent = angles.maxOf { -(RadialMenuGeometry.itemCenterX(it, radius.toDouble())) + halfX(it) }.toFloat()
+        val rightExtent = angles.maxOf { RadialMenuGeometry.itemCenterX(it, radius.toDouble()) + halfX(it) }.toFloat()
+        val topExtent = angles.maxOf { -(RadialMenuGeometry.itemCenterY(it, radius.toDouble())) + halfY(it) }.toFloat()
+        val bottomExtent = angles.maxOf { RadialMenuGeometry.itemCenterY(it, radius.toDouble()) + halfY(it) }.toFloat()
+
+        // Shift the ball just enough that the whole (symmetric) fan is visible
+        // above the keyboard and within the screen.
+        val minAnchorX = margin + leftExtent
+        val maxAnchorX = (screenW - margin - rightExtent).coerceAtLeast(minAnchorX)
+        val anchorX = curCenterX.coerceIn(minAnchorX, maxAnchorX)
+        val minAnchorY = safeTop + topExtent
+        val maxAnchorY = (safeBottom - bottomExtent).coerceAtLeast(minAnchorY)
+        val anchorY = curCenterY.coerceIn(minAnchorY, maxAnchorY)
+
+        // Reposition instantly (a few px) so the fan and ball are always aligned.
+        menuActive = true
+        menuRestoreX = params.x
+        menuRestoreY = params.y
+        params.x = (anchorX - size / 2f - padding).toInt()
+        params.y = (anchorY - size / 2f - padding).toInt()
+        updateLayout(view, params)
+
+        // Menu window: clamp on-screen and draw around the ball's origin so an OEM
+        // window shift can never move the fan off the ball.
+        val maxReach = hypot(aHalf.toDouble(), bHalf.toDouble()).toFloat()
+        val boxPad = size * 0.10f
+        val windowSize = ceil(2f * (radius + maxReach) + 2f * boxPad).toInt()
+        val placeX = RadialMenuGeometry.clampWindow(anchorX, windowSize, screenW)
+        val placeY = RadialMenuGeometry.clampWindow(anchorY, windowSize, screenH)
+
+        menuCenterX = anchorX.toInt()
+        menuCenterY = anchorY.toInt()
+        menuCenters = angles.map {
+            RadialMenuGeometry.itemCenterX(it, radius.toDouble()) to
+                RadialMenuGeometry.itemCenterY(it, radius.toDouble())
+        }
+        menuCaptureRadius = hypot(capsuleWidth / 2.0, capsuleHeight / 2.0) * 1.05
+        menuHasUndo = undoAvailable
+        radialMenu.show(
+            placeX.windowPos, placeY.windowPos, windowSize, placeX.origin, placeY.origin,
+            items, radius, capsuleWidth, capsuleHeight, centerAngle.toFloat(), sweep.toFloat(),
+        )
+        Haptics.tick(context)
+    }
+
+    private fun menuHitTest(rawX: Float, rawY: Float): Int =
+        RadialMenuGeometry.hitTest(
+            (rawX - menuCenterX).toDouble(),
+            (rawY - menuCenterY).toDouble(),
+            menuCenters,
+            menuCaptureRadius,
+        )
+
+    private fun dismissRadialMenu() {
+        menuActive = false
+        radialMenu.hide()
+        restoreBallAfterMenu()
+    }
+
+    private fun restoreBallAfterMenu() {
+        val targetX = menuRestoreX
+        val targetY = menuRestoreY
+        menuRestoreX = Int.MIN_VALUE
+        menuRestoreY = Int.MIN_VALUE
+        if (targetX == Int.MIN_VALUE || targetY == Int.MIN_VALUE) return
+        val view = ballView ?: return
+        val params = layoutParams ?: return
+        restoreAnimator?.cancel()
+        val startX = params.x
+        val startY = params.y
+        if (startX == targetX && startY == targetY) return
+        restoreAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 160L
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { a ->
+                val f = a.animatedFraction
+                params.x = (startX + (targetX - startX) * f).toInt()
+                params.y = (startY + (targetY - startY) * f).toInt()
+                updateLayout(view, params)
+            }
+            start()
+        }
+    }
+
     private inner class BallTouchListener : View.OnTouchListener {
         private var downRawX = 0f
         private var downRawY = 0f
@@ -231,9 +413,12 @@ class OverlayBallManager(
         private val longPressRunnable = Runnable {
             if (!dragging) {
                 longPressHandled = true
-                pipeline.toggleInputMode()
+                if (pipeline.canSelectMode()) openRadialMenu()
             }
         }
+
+        private fun movedEnough(x: Float, y: Float): Boolean =
+            hypot((x - downRawX).toDouble(), (y - downRawY).toDouble()) > touchSlop * 1.5
 
         override fun onTouch(v: View, event: MotionEvent): Boolean {
             val params = layoutParams ?: return false
@@ -247,10 +432,20 @@ class OverlayBallManager(
                     downTime = System.currentTimeMillis()
                     dragging = false
                     longPressHandled = false
+                    ballView?.setPressedVisual(true)
                     handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (menuActive) {
+                        val index = if (movedEnough(event.rawX, event.rawY)) {
+                            menuHitTest(event.rawX, event.rawY)
+                        } else {
+                            -1
+                        }
+                        radialMenu.highlight(index)
+                        return true
+                    }
                     val dx = event.rawX - downRawX
                     val dy = event.rawY - downRawY
                     if (!dragging && hypot(dx.toDouble(), dy.toDouble()) > touchSlop) {
@@ -262,8 +457,6 @@ class OverlayBallManager(
                         val margin = marginPx()
                         val size = ballSizePx()
                         val padding = BallMetrics.ripplePadding(size)
-                        // Clamp the visible ball (not the padded window) to the
-                        // same margins as before, then offset back to window coords.
                         val ballX = (downX + padding + dx).toInt()
                             .coerceIn(margin, max(margin, metrics.widthPixels - size - margin))
                         val ballY = (downY + padding + dy).toInt()
@@ -276,6 +469,24 @@ class OverlayBallManager(
                 }
                 MotionEvent.ACTION_UP -> {
                     handler.removeCallbacks(longPressRunnable)
+                    ballView?.setPressedVisual(false)
+                    if (menuActive) {
+                        val index = if (movedEnough(event.rawX, event.rawY)) {
+                            menuHitTest(event.rawX, event.rawY)
+                        } else {
+                            -1
+                        }
+                        val hadUndo = menuHasUndo
+                        dismissRadialMenu()
+                        if (index >= 0) {
+                            if (hadUndo && index == menuModes.size) {
+                                pipeline.undo()
+                            } else {
+                                pipeline.selectMode(menuModes[index])
+                            }
+                        }
+                        return true
+                    }
                     val duration = System.currentTimeMillis() - downTime
                     if (dragging) {
                         snapToEdge()
@@ -287,7 +498,12 @@ class OverlayBallManager(
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     handler.removeCallbacks(longPressRunnable)
-                    if (dragging) snapToEdge()
+                    ballView?.setPressedVisual(false)
+                    if (menuActive) {
+                        dismissRadialMenu()
+                    } else if (dragging) {
+                        snapToEdge()
+                    }
                     return true
                 }
                 else -> return false
@@ -298,5 +514,6 @@ class OverlayBallManager(
     companion object {
         private const val CLICK_TIMEOUT_MS = 600L
         private const val LONG_PRESS_MS = 500L
+        private val UNDO_COLOR = Color.parseColor("#475569")
     }
 }

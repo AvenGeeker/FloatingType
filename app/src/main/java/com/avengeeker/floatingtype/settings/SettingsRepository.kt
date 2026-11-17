@@ -143,6 +143,20 @@ class SettingsRepository(context: Context) {
             notifyChanged()
         }
 
+    /**
+     * Translation target language code (see TranslatePrompt). "auto" means
+     * Chinese-dominant text -> English, otherwise -> Chinese. Translation
+     * reuses the polish endpoint/key/model, so this is a plain in-app pref
+     * with no local.properties override.
+     */
+    var translateTargetLanguage: String
+        get() = prefs.getString(KEY_TRANSLATE_TARGET, DEFAULT_TRANSLATE_TARGET)
+            .orEmpty().ifBlank { DEFAULT_TRANSLATE_TARGET }
+        set(value) {
+            prefs.edit().putString(KEY_TRANSLATE_TARGET, value.trim().ifBlank { DEFAULT_TRANSLATE_TARGET }).apply()
+            notifyChanged()
+        }
+
     var ballEnabled: Boolean
         get() = prefs.getBoolean(KEY_BALL_ENABLED, true)
         set(value) {
@@ -183,6 +197,7 @@ class SettingsRepository(context: Context) {
             "你是语音输入的文本润色助手。将用户提供的语音转写文本整理成自然、通顺、简洁的表达，" +
                 "修正错别字、标点和口语冗余；保留原意和必要信息，不要扩写、不要添加原文没有的内容、" +
                 "不要回答问题，只输出润色后的文本。"
+        const val DEFAULT_TRANSLATE_TARGET = "auto"
         const val DEFAULT_BALL_SIZE_DP = 52
         const val MIN_BALL_SIZE_DP = 40
         const val MAX_BALL_SIZE_DP = 72
@@ -200,6 +215,7 @@ class SettingsRepository(context: Context) {
         private const val KEY_POLISH_API_KEY = "polish_api_key"
         private const val KEY_POLISH_MODEL = "polish_model"
         private const val KEY_POLISH_PROMPT = "polish_prompt"
+        private const val KEY_TRANSLATE_TARGET = "translate_target_language"
         private const val KEY_BALL_ENABLED = "ball_enabled"
         private const val KEY_BALL_SIZE = "ball_size_dp"
         private const val KEY_BALL_OPACITY = "ball_opacity"

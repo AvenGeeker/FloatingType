@@ -11,6 +11,7 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.avengeeker.floatingtype.accessibility.FloatingAccessibilityService
+import com.avengeeker.floatingtype.accessibility.TextInjector
 import com.avengeeker.floatingtype.asr.AsrEngine
 import com.avengeeker.floatingtype.asr.AsrException
 import com.avengeeker.floatingtype.audio.AudioRecordingForegroundService
@@ -24,6 +25,8 @@ import com.avengeeker.floatingtype.overlay.OverlayBallManager
 import com.avengeeker.floatingtype.polish.PolishEngine
 import com.avengeeker.floatingtype.polish.PolishException
 import com.avengeeker.floatingtype.settings.SettingsRepository
+import com.avengeeker.floatingtype.translate.TranslateEngine
+import com.avengeeker.floatingtype.translate.TranslateException
 import com.avengeeker.floatingtype.util.Haptics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,11 +37,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Orchestrates: ball tap -> microphone foreground service -> batch ASR ->
- * optional AI polish -> accessibility text injection -> local history.
- * Toggle interaction: tap to start, tap again to stop. Long-press toggles
- * the persisted input mode. All state transitions run on the main thread;
- * network work runs on Dispatchers.IO inside the engines.
+ * Orchestrates two flows, all state transitions on the main thread, network on
+ * Dispatchers.IO inside the engines:
+ *
+ *  1. Voice: ball tap -> microphone FGS -> batch ASR -> optional polish/translate
+ *     -> accessibility injection -> local history. Tap starts, tap again stops.
+ *  2. Post-processing: long-press opens the radial mode menu; picking POLISH or
+ *     TRANSLATE while the focused field already holds text rewrites that text in
+ *     place (no recording, no history session). The last text rewrite is undoable.
+ *
+ * Long-press no longer toggles the mode directly; the overlay drives mode choice
+ * through [selectMode]. A short-lived undo snapshot lets the user revert the most
+ * recent rewrite (voice injection or post-processing) without clobbering edits
+ * made afterwards.
  */
 class VoiceInputPipeline(
     private val context: Context,
@@ -46,6 +57,7 @@ class VoiceInputPipeline(
     private val history: HistoryRepository,
     private val asrFactory: () -> AsrEngine,
     private val polishFactory: () -> PolishEngine,
+    private val translateFactory: () -> TranslateEngine,
 ) {
     var overlay: OverlayBallManager? = null
 
@@ -53,14 +65,20 @@ class VoiceInputPipeline(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val handler = Handler(Looper.getMainLooper())
     private var transcribeJob: Job? = null
+    private var processingJob: Job? = null
     private var session: Session? = null
 
     private val _state = MutableStateFlow(BallState.IDLE)
     val state: StateFlow<BallState> = _state
 
+    /** Notified (on the main thread) when an undo becomes available or clears. */
+    var undoAvailabilityListener: ((Boolean) -> Unit)? = null
+    private var lastUndo: UndoOperation? = null
+
     private val resetRunnable = Runnable {
         if (_state.value == BallState.ERROR) setState(BallState.IDLE)
     }
+    private val undoExpireRunnable = Runnable { clearUndo() }
 
     /** One recorded voice-input session; written to history once at the end. */
     private class Session(
@@ -105,6 +123,19 @@ class VoiceInputPipeline(
         )
     }
 
+    /**
+     * Snapshot of the field before a rewrite plus the text we wrote. Undo only
+     * restores while the field still equals [resultText], so later user edits are
+     * never overwritten. The polish* history columns double as the generic
+     * post-ASR transform stage (polish or translate, interpreted by mode).
+     */
+    private class UndoOperation(
+        val originalText: String,
+        val originalSelectionStart: Int,
+        val originalSelectionEnd: Int,
+        val resultText: String,
+    )
+
     fun isBusy(): Boolean =
         _state.value == BallState.RECORDING ||
             _state.value == BallState.TRANSCRIBING ||
@@ -120,22 +151,135 @@ class VoiceInputPipeline(
         }
         service = null
         transcribeJob?.cancel()
+        processingJob?.cancel()
         session = null
+        clearUndo()
         if (isBusy()) setState(BallState.IDLE)
     }
 
-    /** Long-press entry point: toggle and persist the default input mode. */
-    fun toggleInputMode(): Boolean {
+    /** Guard for opening the radial mode menu (long-press). */
+    fun canSelectMode(): Boolean {
         if (isBusy()) {
-            Log.w(TAG, "toggleInputMode ignored: session busy (state=${_state.value})")
+            Log.w(TAG, "mode selection ignored: busy (state=${_state.value})")
             toast("当前正在输入，无法切换模式")
             return false
         }
-        val next = settings.defaultMode.next()
-        settings.defaultMode = next
-        Haptics.tick(context)
-        toast("已切换为${next.label}模式")
         return true
+    }
+
+    /**
+     * Radial-menu entry point: persist the chosen mode and, for a transform mode
+     * with text already in the focused field, post-process that text in place.
+     */
+    fun selectMode(mode: InputMode) {
+        if (isBusy()) {
+            toast("当前正在输入，无法切换模式")
+            return
+        }
+        settings.defaultMode = mode
+        Haptics.tick(context)
+        val svc = service
+        if (mode.isTransform && svc != null && FloatingAccessibilityService.isConnected) {
+            val snapshot = svc.inputSnapshot()
+            if (snapshot != null && snapshot.text.isNotBlank()) {
+                postProcessExistingText(mode, snapshot)
+                return
+            }
+        }
+        toast("已切换为${mode.label}模式")
+    }
+
+    /** Rewrite existing field text with the chosen transform engine (no history). */
+    private fun postProcessExistingText(mode: InputMode, snapshot: TextInjector.Snapshot) {
+        val svc = service ?: return
+        Log.i(TAG, "post-process start: mode=$mode chars=${snapshot.text.length}")
+        setState(BallState.TRANSCRIBING)
+        processingJob = scope.launch {
+            val result = when (mode) {
+                InputMode.POLISH -> polishFactory().polish(snapshot.text)
+                InputMode.TRANSLATE ->
+                    translateFactory().translate(snapshot.text, settings.translateTargetLanguage)
+                InputMode.TRANSCRIBE -> Result.success(snapshot.text)
+            }
+            result.fold(
+                onSuccess = { transformed ->
+                    // The user may have edited the field while the engine ran;
+                    // never clobber those edits.
+                    if (svc.currentInputText() != snapshot.text) {
+                        Log.w(TAG, "post-process aborted: field changed during processing")
+                        setState(BallState.IDLE)
+                        toast("输入框内容已变化，已取消${mode.label}")
+                        return@fold
+                    }
+                    setState(BallState.INJECTING)
+                    val ok = svc.replaceInputText(transformed)
+                    if (ok) {
+                        Log.i(TAG, "post-process success: mode=$mode chars=${transformed.length}")
+                        registerUndo(snapshot, transformed)
+                        Haptics.success(context)
+                        setState(BallState.IDLE)
+                        toast("${mode.label}完成")
+                    } else {
+                        Log.e(TAG, "post-process replace failed (focused field lost?)")
+                        fail("无法写入输入框，请重新点击输入框后再试")
+                    }
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "post-process failed: mode=$mode ${formatError(error)}", error)
+                    fail("${mode.label}失败：${error.message ?: "未知错误"}")
+                },
+            )
+        }
+    }
+
+    /** Restore the most recent rewrite if the field has not changed since. */
+    fun undo() {
+        val op = lastUndo
+        if (op == null) {
+            clearUndo()
+            return
+        }
+        val svc = service
+        if (svc == null) {
+            clearUndo()
+            return
+        }
+        if (svc.currentInputText() == op.resultText) {
+            // Negative selection indices mean "no selection"; restore cursor at end.
+            val selStart = op.originalSelectionStart.takeIf { it >= 0 }
+            val selEnd = op.originalSelectionEnd.takeIf { it >= 0 }
+            val ok = svc.replaceInputText(op.originalText, selStart, selEnd)
+            if (ok) {
+                Log.i(TAG, "undo success: restoredChars=${op.originalText.length}")
+                Haptics.tick(context)
+                toast("已撤回")
+            } else {
+                Log.e(TAG, "undo replace failed (focused field lost?)")
+                toast("撤回失败，请重新点击输入框")
+            }
+        } else {
+            Log.w(TAG, "undo skipped: field changed since rewrite")
+            toast("内容已变化，无法撤回")
+        }
+        clearUndo()
+    }
+
+    private fun registerUndo(original: TextInjector.Snapshot, resultText: String) {
+        lastUndo = UndoOperation(
+            originalText = original.text,
+            originalSelectionStart = original.selectionStart,
+            originalSelectionEnd = original.selectionEnd,
+            resultText = resultText,
+        )
+        handler.removeCallbacks(undoExpireRunnable)
+        handler.postDelayed(undoExpireRunnable, UNDO_TTL_MS)
+        undoAvailabilityListener?.invoke(true)
+    }
+
+    fun clearUndo() {
+        lastUndo = null
+        handler.removeCallbacks(undoExpireRunnable)
+        undoAvailabilityListener?.invoke(false)
     }
 
     /** Ball click entry point. */
@@ -181,12 +325,12 @@ class VoiceInputPipeline(
             sourcePackage = sourcePackage,
             sourceAppLabel = resolveAppLabel(sourcePackage),
             asrModel = settings.model,
-            polishModel = if (mode == InputMode.POLISH) settings.polishModel else null,
+            polishModel = if (mode.isTransform) settings.polishModel else null,
         )
         Log.i(
             TAG,
             "session start: mode=$mode asrModel=${settings.model} " +
-                "polishModel=${if (mode == InputMode.POLISH) settings.polishModel else "<none>"} " +
+                "transformModel=${if (mode.isTransform) settings.polishModel else "<none>"} " +
                 "sourcePackage=$sourcePackage"
         )
         setState(BallState.RECORDING)
@@ -270,37 +414,62 @@ class VoiceInputPipeline(
     }
 
     private suspend fun afterAsr(s: Session, text: String) {
-        if (s.mode == InputMode.POLISH) {
-            val result = polishFactory().polish(text)
-            result.fold(
-                onSuccess = { polished ->
-                    Log.i(TAG, "polish success: chars=${polished.length}")
-                    s.finalText = polished
-                    s.polishStatus = StageStatus.SUCCESS
-                    inject(s)
-                },
-                onFailure = { error ->
-                    Log.w(TAG, "polish failed, falling back to raw text: ${formatError(error)}", error)
-                    s.finalText = text
-                    s.polishStatus = StageStatus.FAILED
-                    s.polishError = formatError(error)
-                    toast("润色失败，已输入原文")
-                    inject(s)
-                },
-            )
-        } else {
-            s.polishStatus = StageStatus.SKIPPED
-            s.finalText = text
-            inject(s)
+        when (s.mode) {
+            InputMode.POLISH -> {
+                val result = polishFactory().polish(text)
+                result.fold(
+                    onSuccess = { polished ->
+                        Log.i(TAG, "polish success: chars=${polished.length}")
+                        s.finalText = polished
+                        s.polishStatus = StageStatus.SUCCESS
+                        inject(s)
+                    },
+                    onFailure = { error ->
+                        Log.w(TAG, "polish failed, falling back to raw text: ${formatError(error)}", error)
+                        s.finalText = text
+                        s.polishStatus = StageStatus.FAILED
+                        s.polishError = formatError(error)
+                        toast("润色失败，已输入原文")
+                        inject(s)
+                    },
+                )
+            }
+            InputMode.TRANSLATE -> {
+                val result = translateFactory().translate(text, settings.translateTargetLanguage)
+                result.fold(
+                    onSuccess = { translated ->
+                        Log.i(TAG, "translate success: chars=${translated.length}")
+                        s.finalText = translated
+                        s.polishStatus = StageStatus.SUCCESS
+                        inject(s)
+                    },
+                    onFailure = { error ->
+                        Log.w(TAG, "translate failed, falling back to raw text: ${formatError(error)}", error)
+                        s.finalText = text
+                        s.polishStatus = StageStatus.FAILED
+                        s.polishError = formatError(error)
+                        toast("翻译失败，已输入原文")
+                        inject(s)
+                    },
+                )
+            }
+            InputMode.TRANSCRIBE -> {
+                s.polishStatus = StageStatus.SKIPPED
+                s.finalText = text
+                inject(s)
+            }
         }
     }
 
     private fun inject(s: Session) {
         setState(BallState.INJECTING)
+        val before = service?.inputSnapshot()
         val ok = service?.injectText(s.finalText) ?: false
         if (ok) {
             Log.i(TAG, "injection success: chars=${s.finalText.length}")
             s.injectionStatus = StageStatus.SUCCESS
+            val after = service?.currentInputText()
+            if (before != null && after != null) registerUndo(before, after)
             Haptics.success(context)
             setState(BallState.IDLE)
             persist(s)
@@ -362,11 +531,15 @@ class VoiceInputPipeline(
     private fun formatError(error: Throwable): String = when (error) {
         is AsrException -> "${error.code}: ${error.message}"
         is PolishException -> "${error.code}: ${error.message}"
+        is TranslateException -> "${error.code}: ${error.message}"
         else -> error.message ?: "未知错误"
     }
 
     companion object {
         private const val TAG = "FloatingType.Pipeline"
         private const val ERROR_RESET_MS = 2000L
+
+        /** How long the undo button stays available after a rewrite. */
+        private const val UNDO_TTL_MS = 8000L
     }
 }

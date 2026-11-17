@@ -13,6 +13,14 @@ object HistoryPresentation {
 
     fun modeLabel(mode: InputMode): String = mode.label
 
+    /**
+     * Name of the post-ASR transform stage for a mode. The polish* history
+     * columns store this stage generically; TRANSLATE reinterprets them as
+     * translation, everything else as polish.
+     */
+    fun transformLabel(mode: InputMode): String =
+        if (mode == InputMode.TRANSLATE) "翻译" else "润色"
+
     fun statusLabel(record: InputHistoryRecord): String = when {
         record.recordingStatus == StageStatus.FAILED -> "录音失败"
         record.asrStatus == StageStatus.FAILED -> "转写失败"
